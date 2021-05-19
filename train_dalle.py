@@ -1,6 +1,7 @@
 import argparse
 from random import choice
 from pathlib import Path
+import numpy as np
 
 # torch
 
@@ -41,7 +42,7 @@ parser.add_argument('--image_text_folder', type = str, required = True,
 parser.add_argument('--truncate_captions', dest='truncate_captions',
                     help='Captions passed in which exceed the max token length will be truncated if this is set.')
 
-parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type = float, default = 0.75,
+parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type = float, default = 0.6,
                     help='Random resized crop lower ratio')
 
 parser.add_argument('--chinese', dest='chinese', action = 'store_true')
@@ -52,6 +53,8 @@ parser.add_argument('--bpe_path', type = str,
                     help='path to your huggingface BPE json file')
 
 parser.add_argument('--fp16', action='store_true')
+
+parser.add_argument('--learning_rate')
 
 parser = distributed_utils.wrap_arg_parser(parser)
 
@@ -68,19 +71,30 @@ VAE_PATH = args.vae_path
 DALLE_PATH = args.dalle_path
 RESUME = exists(DALLE_PATH)
 
-EPOCHS = 20
-BATCH_SIZE = 4
-LEARNING_RATE = 3e-4
-GRAD_CLIP_NORM = 0.5
+EPOCHS = 5
+BATCH_SIZE = 16
+#LEARNING_RATE = 4.5e-4
+LEARNING_RATE = float(args.learning_rate)
 
-MODEL_DIM = 512
-TEXT_SEQ_LEN = 256
-DEPTH = 2
-HEADS = 4
+GRAD_CLIP_NORM = 0
+
+MODEL_DIM = 256
+TEXT_SEQ_LEN = 80
+DEPTH = 8
+HEADS = 8
 DIM_HEAD = 64
-REVERSIBLE = True
+
+REVERSIBLE = False
 LOSS_IMG_WEIGHT = 7
-LR_DECAY = False
+
+ATTN_TYPES = ['full','axial_row','axial_col','conv_like']
+#ATTN_TYPES = ['axial_row', 'axial_col']
+
+LR_DECAY = True
+LR_DECAY_FACTOR = 0.5
+LR_DECAY_PATIENCE = 5
+LR_DECAY_COOLDOWN = 0
+LR_DECAY_MIN = 1e-7
 
 # initialize distributed backend
 
@@ -146,7 +160,8 @@ else:
         heads = HEADS,
         dim_head = DIM_HEAD,
         reversible = REVERSIBLE,
-        loss_img_weight = LOSS_IMG_WEIGHT
+        loss_img_weight = LOSS_IMG_WEIGHT,
+        attn_types = ATTN_TYPES,
     )
 
 # configure OpenAI VAE for float16s
@@ -272,10 +287,10 @@ if LR_DECAY:
     scheduler = ReduceLROnPlateau(
         opt,
         mode = "min",
-        factor = 0.5,
-        patience = 10,
-        cooldown = 10,
-        min_lr = 1e-6,
+        factor = LR_DECAY_FACTOR,
+        patience = LR_DECAY_PATIENCE,
+        cooldown = LR_DECAY_COOLDOWN,
+        min_lr = LR_DECAY_MIN,
         verbose = True,
     )
 
@@ -285,15 +300,30 @@ if distr_backend.is_root_worker():
     import wandb
 
     model_config = dict(
+        epochs = EPOCHS,
+        batch_size = BATCH_SIZE,
+        learning_rate = LEARNING_RATE,
+        grad_clip_norm = GRAD_CLIP_NORM,
+        model_dim = MODEL_DIM,
+        text_seq_len = TEXT_SEQ_LEN,
         depth = DEPTH,
         heads = HEADS,
-        dim_head = DIM_HEAD
+        dim_head = DIM_HEAD,
+        reversible = REVERSIBLE,
+        loss_img_weight = LOSS_IMG_WEIGHT,
+        lr_decay_factor = LR_DECAY_FACTOR,
+        lr_decay_patience = LR_DECAY_PATIENCE,
+        lr_decay_cooldown = LR_DECAY_COOLDOWN,
+        attn_types = ATTN_TYPES,
+        resize_ratio = args.resize_ratio,
     )
 
     run = wandb.init(
-        project = 'dalle_train_transformer',
+        project = 'dalle_train_CUB_proper',
         resume = RESUME,
         config = model_config,
+        save_code=True,
+        #id="worldly_salad_no_10epoch",
     )
 
 # distribute
@@ -318,6 +348,10 @@ deepspeed_config = {
 )
 avoid_model_calls = using_deepspeed and args.fp16
 
+LOG_FILENAME = f"{run.name}.txt"
+
+f = open(LOG_FILENAME, "a+")
+
 # training
 torch.cuda.empty_cache() # Avoid allocation error due to potential bug in deepspeed. See https://github.com/lucidrains/DALLE-pytorch/issues/161
 for epoch in range(EPOCHS):
@@ -334,13 +368,14 @@ for epoch in range(EPOCHS):
             # Gradients are automatically zeroed after the step
         else:
             loss.backward()
-            clip_grad_norm_(distr_dalle.parameters(), GRAD_CLIP_NORM)
+            if GRAD_CLIP_NORM > 0:
+                clip_grad_norm_(distr_dalle.parameters(), GRAD_CLIP_NORM)
             distr_opt.step()
             distr_opt.zero_grad()
 
         # Collective loss, averaged
         avg_loss = distr_backend.average_all(loss)
-
+        f.write(f"{epoch} {i} {avg_loss.item()} {opt.param_groups[0]['lr']}\n")
         if distr_backend.is_root_worker():
             log = {}
 
@@ -351,8 +386,12 @@ for epoch in range(EPOCHS):
                     **log,
                     'epoch': epoch,
                     'iter': i,
-                    'loss': avg_loss.item()
+                    'loss': avg_loss.item(),
+                    'lr': opt.param_groups[0]['lr'],
                 }
+
+                f.close()
+                f = open(LOG_FILENAME, "a+")
 
             if i % 100 == 0:
                 sample_text = text[:1]
@@ -364,31 +403,35 @@ for epoch in range(EPOCHS):
                     image = dalle.generate_images(text[:1], filter_thres = 0.9) # topk sampling at 0.9
 
                 save_model(f'./dalle.pt')
-                wandb.save(f'./dalle.pt')
+                #wandb.save(f'./dalle.pt')
 
                 log = {
                     **log,
                 }
                 if not avoid_model_calls:
                     log['image'] = wandb.Image(image, caption = decoded_text)
-
             wandb.log(log)
 
     if LR_DECAY:
         distr_scheduler.step(loss)
 
-    if distr_backend.is_root_worker():
-        # save trained model to wandb as an artifact every epoch's end
+    #if distr_backend.is_root_worker():
+    #    # save trained model to wandb as an artifact every epoch's end
+    #
+    #    model_artifact = wandb.Artifact('trained-dalle', type = 'model', metadata = dict(model_config))
+    #    model_artifact.add_file('dalle.pt')
+    #    run.log_artifact(model_artifact)
 
-        model_artifact = wandb.Artifact('trained-dalle', type = 'model', metadata = dict(model_config))
-        model_artifact.add_file('dalle.pt')
-        run.log_artifact(model_artifact)
+    if epoch %19 == 0:
+        save_model(f'./sweep1/{run.name}-{epoch}.pt')
+
+f.close()
 
 if distr_backend.is_root_worker():
     save_model(f'./dalle-final.pt')
-    wandb.save('./dalle-final.pt')
-    model_artifact = wandb.Artifact('trained-dalle', type = 'model', metadata = dict(model_config))
-    model_artifact.add_file('dalle-final.pt')
-    run.log_artifact(model_artifact)
+    wandb.save(f'./{run.name}-dalle-final.pt')
+    #model_artifact = wandb.Artifact('trained-dalle', type = 'model', metadata = dict(model_config))
+    #model_artifact.add_file(f'./{run.name}-dalle-final.pt')
+    #run.log_artifact(model_artifact)
 
     wandb.finish()

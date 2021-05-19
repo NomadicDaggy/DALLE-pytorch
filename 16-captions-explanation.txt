@@ -1,0 +1,17 @@
+003.Sooty_Albatross pelēks
+012.Yellow_Headed_Blackbird dzeltens-melns
+015.Lazuli_Bunting zils-oranžs
+018.Spotted_Catbird zaļš
+026.Bronzed_Cowbird melns
+028.Brown_Creeper brūns
+042.Vermilion_Flycatcher sarkans(vermilion)
+045.Northern_Fulmar balts
+047.American_Goldfinch dzeltens
+054.Blue_Grosbeak zils
+057.Rose_Breasted_Grosbeak melns-sarkans-balts
+062.Herring_Gull balts
+070.Green_Violetear zaļš-zils
+078.Gray_Kingbird pelēks
+099.Ovenbird brūns
+188.Pileated_Woodpecker sarkans-melns
+

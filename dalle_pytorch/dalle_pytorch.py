@@ -294,7 +294,7 @@ class DALLE(nn.Module):
         vae,
         num_text_tokens = 10000,
         text_seq_len = 256,
-        depth,
+        depth = 8,
         heads = 8,
         dim_head = 64,
         reversible = False,

@@ -18,6 +18,8 @@ from torchvision.utils import make_grid, save_image
 from dalle_pytorch import DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024, DALLE
 from dalle_pytorch.tokenizer import tokenizer, HugTokenizer
 
+import pandas as pd
+
 # argument parsing
 
 parser = argparse.ArgumentParser()
@@ -25,7 +27,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--dalle_path', type = str, required = True,
                     help='path to your trained DALL-E')
 
-parser.add_argument('--text', type = str, required = True,
+parser.add_argument('--text', type = str, required = False,
                     help='your text prompt')
 
 parser.add_argument('--num_images', type = int, default = 128, required = False,
@@ -88,27 +90,67 @@ dalle.load_state_dict(weights)
 
 image_size = vae.image_size
 
-texts = args.text.split('|')
+if exists(args.text):
+    texts = args.text.split('|')
+    for text in tqdm(texts):
+        text = tokenizer.tokenize([args.text], dalle.text_seq_len).cuda()
 
-for text in tqdm(texts):
-    text = tokenizer.tokenize([args.text], dalle.text_seq_len).cuda()
+        text = repeat(text, '() n -> b n', b = args.num_images)
 
-    text = repeat(text, '() n -> b n', b = args.num_images)
+        outputs = []
 
-    outputs = []
+        for text_chunk in tqdm(text.split(args.batch_size), desc = f'generating images for - {text}'):
+            output = dalle.generate_images(text_chunk, filter_thres = args.top_k)
+            outputs.append(output)
 
-    for text_chunk in tqdm(text.split(args.batch_size), desc = f'generating images for - {text}'):
-        output = dalle.generate_images(text_chunk, filter_thres = args.top_k)
-        outputs.append(output)
+        outputs = torch.cat(outputs)
 
-    outputs = torch.cat(outputs)
+        # save all images
 
-    # save all images
 
-    outputs_dir = Path(args.outputs_dir) / args.text.replace(' ', '_')
-    outputs_dir.mkdir(parents = True, exist_ok = True)
+        outputs_dir = Path(args.outputs_dir) / (args.dalle_path.replace('.','').replace('/','') + '-' + args.text.replace(' ', '_'))
+        outputs_dir.mkdir(parents = True, exist_ok = True)
 
-    for i, image in tqdm(enumerate(outputs), desc = 'saving images'):
-        save_image(image, outputs_dir / f'{i}.jpg', normalize=True)
+        for i, image in tqdm(enumerate(outputs), desc = 'saving images'):
+            save_image(image, outputs_dir / f'{i}.jpg', normalize=True)
 
-    print(f'created {args.num_images} images at "{str(outputs_dir)}"')
+        print(f'created {args.num_images} images at "{str(outputs_dir)}"')
+else:
+    cap_df = pd.read_pickle("./cub_2011_test_captions.pkl")
+    # generate images
+    for i, row in cap_df.iterrows():
+        temp_text = tokenizer.tokenize([row["caption"]], dalle.text_seq_len).cuda()  #,True,True).cuda()
+        if i == 0:
+            text = temp_text
+            continue
+        text = torch.cat((text, temp_text),0)
+    
+    def generate_batch(bb, text):
+        outputs = []
+
+        for text_chunk in tqdm(text.split(args.batch_size), desc = f'generating images for - {bb}'):
+            output = dalle.generate_images(text_chunk, filter_thres = args.top_k)
+            outputs.append(output)
+
+        outputs = torch.cat(outputs)
+
+        # save all images
+
+        outputs_dir = Path(args.outputs_dir)
+        outputs_dir.mkdir(parents = True, exist_ok = True)
+
+        for i, image in tqdm(enumerate(outputs), desc = 'saving images'):
+            save_image(image, outputs_dir / f'{bb}-{i}.jpg', normalize=True)
+
+        print(f'created {bb} images at "{str(outputs_dir)}"')
+
+    big_batch = 30
+    max_idx = len(text)  # non-inclusive
+    print("len: ", max_idx)
+
+    for bb in range(1000):
+        s = bb*big_batch
+        e = (bb+1)*big_batch
+        if e > max_idx:
+            e = max_idx
+        generate_batch(bb, text[s:e].cuda())
